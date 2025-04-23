@@ -1,0 +1,25 @@
+# Video and image files
+*.mp4
+*.jpg
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDEs
+.idea/
+.vscode/
+
+# Temporary files
+*.log
+*.cache
