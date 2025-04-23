@@ -12,7 +12,7 @@ Blurface is a command-line tool to blur human faces in MP4 videos using face det
 
 ## Installation
 
-Blurface requires Python 3.9 or higher. We recommend using a Conda environment for installation.
+Blurface requires Python 3.9 or higher. We recommend using a Conda environment for installation, directly via `pip install blurface` or by the steps as follows.
 
 1. **Clone the repository**:
    ```bash
