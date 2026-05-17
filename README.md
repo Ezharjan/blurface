@@ -19,19 +19,34 @@
 
 ## Table of contents
 
-- [Installation](#installation)
-- [Verify your GPU](#verify-your-gpu)
-- [Usage: `blurface` CLI](#usage-blurface-cli)
-- [Python API](#python-api)
-- [Pipeline internals](#pipeline-internals)
-- [Detection methods explained](#detection-methods-explained)
-- [Evaluation: `blurface-eval`](#evaluation-blurface-eval)
-- [Metrics reference](#metrics-reference)
-- [GPU diagnostic: `blurface-install-gpu`](#gpu-diagnostic-blurface-install-gpu)
-- [Testing](#testing)
-- [Troubleshooting](#troubleshooting)
-- [Changelog](#changelog)
-- [License](#license)
+- [Blurface](#blurface)
+  - [Highlights](#highlights)
+  - [Table of contents](#table-of-contents)
+  - [Installation](#installation)
+    - [1. Create / activate a Python environment](#1-create--activate-a-python-environment)
+    - [2. Install PyTorch — with CUDA wheels if you have an NVIDIA GPU](#2-install-pytorch--with-cuda-wheels-if-you-have-an-nvidia-gpu)
+    - [3. Install Blurface](#3-install-blurface)
+    - [4. Install FFmpeg](#4-install-ffmpeg)
+  - [Verify your GPU](#verify-your-gpu)
+  - [Usage: `blurface` CLI](#usage-blurface-cli)
+    - [Worked examples](#worked-examples)
+  - [Python API](#python-api)
+  - [Pipeline internals](#pipeline-internals)
+    - [Performance knobs](#performance-knobs)
+  - [Detection methods explained](#detection-methods-explained)
+    - [YOLOv8-face (default, `--backend yolo`)](#yolov8-face-default---backend-yolo)
+    - [facenet-pytorch MTCNN (fallback, `--backend mtcnn`)](#facenet-pytorch-mtcnn-fallback---backend-mtcnn)
+    - [`--backend auto`](#--backend-auto)
+  - [Evaluation: `blurface-eval`](#evaluation-blurface-eval)
+  - [Metrics reference](#metrics-reference)
+  - [GPU diagnostic: `blurface-install-gpu`](#gpu-diagnostic-blurface-install-gpu)
+  - [Testing](#testing)
+  - [Troubleshooting](#troubleshooting)
+  - [Changelog](#changelog)
+    - [0.2.0 — 2026](#020--2026)
+    - [0.1.0](#010)
+  - [License](#license)
+  - [Contact](#contact)
 
 ## Installation
 
@@ -194,6 +209,9 @@ blurface input.mp4 --model-path /path/to/yolov8n-face.pt
 
 # 7. Raise the inference image size for lots of tiny faces.
 blurface input.mp4 --imgsz 1280 --batch-size 4
+
+# 8. Full evaluation: report + plots + CPU-vs-GPU benchmark
+blurface-eval video.mp4 --output D:\blurface\out\blurred.mp4 --report-dir D:\blurface\out\report --device auto --batch-size 8 --benchmark --benchmark-frames 120
 ```
 
 ## Python API
@@ -240,7 +258,7 @@ The video is processed in five clearly-separated stages, kept on the same `torch
    - it is then **up-sampled** back to the box size with `F.interpolate(mode="nearest")` — that's the classic pixelation effect, computed in a single bilinear + nearest kernel pair;
    - for `blur_shape="ellipse"` an inscribed elliptical mask is built on-device (`(x − cx)² / rx² + (y − cy)² / ry² ≤ 1`) and the mosaic is alpha-blended over the original — only the elliptical region is replaced, the corners of the bounding box are preserved.
 4. **Encode (CPU).** The blurred frame is clamped, cast back to `uint8`, transposed to HWC, copied to the CPU, and written to a temporary `mp4v`-encoded MP4 with `cv2.VideoWriter`.
-5. **Mux (FFmpeg).** Finally `ffmpeg` re-encodes the temporary video as **H.264 (libx264, CRF 20, `medium` preset)** and re-multiplexes the **original AAC audio (192 kbit/s)** back in with `-map 0:v:0 -map 1:a:0?`. If `ffmpeg` is not on `PATH`, Blurface falls back to the `ffmpeg-python` bindings; if both fail, the video-only output is preserved.
+5. **Mux (FFmpeg).** Finally `ffmpeg` re-encodes the temporary video as **H.264 (libx264, CRF 20, `medium` preset)** and **stream-copies the original audio track** with `-c:a copy -map 0:v:0 -map 1:a:0?`. The audio is preserved **bit-for-bit** — no re-encoding, no quality loss, same codec / bitrate / sample rate as the source. If stream-copy is rejected (rare; happens when the source audio codec isn't allowed in the MP4 container, e.g. PCM) Blurface falls back to a 192 kbit/s AAC re-encode. `ffprobe` then verifies the output actually contains audio when the source did — mismatches raise rather than silently producing a muted file. If `ffmpeg` is missing and the source has audio, Blurface fails loudly with install instructions instead of dropping the audio.
 
 Throughout the run, optional per-frame metrics (detect / mosaic latency, GPU memory, face counts, mean confidence) are collected into a `RunReport`, which `render_plots` turns into PNG charts and a CSV.
 
@@ -407,7 +425,7 @@ That's a warning emitted by the `transformers` library when *something else* in 
 
 **`CUDA out of memory`.** Lower `--batch-size`, enable `--half`, or lower `--imgsz`.
 
-**No audio in the output.** `ffmpeg` is not on `PATH`. Install it (see [step 4](#4-install-ffmpeg)) and re-run.
+**No audio in the output.** This should never happen silently in v0.2.0 — if the source has audio and `ffmpeg` can't preserve it, Blurface raises with install instructions. If you do see a muted output, first check: did the *source* have an audio track? (Run `ffprobe -i your_input.mp4` and look for a `Stream #0:1: Audio:` line.) If the source genuinely has no audio, the muted output is correct. If the source does have audio and you got a muted output anyway, please file a bug at <https://github.com/Ezharjan/blurface/issues>.
 
 **macOS MPS warnings about unimplemented ops.** Harmless — those ops automatically fall back to CPU.
 
@@ -417,6 +435,12 @@ That's a warning emitted by the `transformers` library when *something else* in 
 
 ### 0.2.0 — 2026
 
+- **Audio preservation (bug fix).** Previously, three silent-failure paths in the mux step could quietly produce a **muted** output: the outer wrapper caught any ffmpeg error and copied the audio-less temp file, the ffmpeg-python fallback re-encoded video alone on failure, and even on the happy path the audio was *re-encoded* to AAC 192k (a quality loss). The mux now:
+  - **Stream-copies the original audio** (`-c:a copy`) — preserved bit-for-bit, same codec / bitrate / sample rate as the source. No re-encoding.
+  - Probes the source with `ffprobe` to decide whether to expect audio at all.
+  - Falls back to AAC 192k *only* if stream-copy is rejected by the MP4 container.
+  - Verifies the output actually contains audio when the source did; raises if not.
+  - Raises a clear, actionable error (with install instructions) when ffmpeg is missing and the source has audio, instead of silently dropping the track.
 - **Packaging:** `blurface-install-gpu` now ships inside the installed package, so the console script works after `pip install` (it was broken before). PyPI metadata (`project_urls`, `keywords`, full `classifiers`, MANIFEST, `pyproject.toml`) brought up to standard.
 - **Pipeline:** fixed an aggregation bug where `RunReport.total_faces_detected`, `frames_with_faces`, `detect_time_s`, and `mosaic_time_s` were `0` when `process_video(..., collect_metrics=False)`. They are now tracked independently of the per-frame list.
 - **Report:** new `frames_processed` and `total_faces_detected` fields on `RunReport`; `summary.json` and the PNG scorecard updated to match.

@@ -21,9 +21,12 @@ hand-off does not pay for an unnecessary host round-trip:
 4.  **Encode.** The blurred frame is moved back to the CPU, converted to a
     contiguous ``uint8`` HWC array, and written to a temporary video with
     ``cv2.VideoWriter`` (FOURCC ``mp4v``).
-5.  **Mux.** The final step shells out to ``ffmpeg`` (or, if unavailable,
-    falls back to the ``ffmpeg-python`` bindings) to re-encode the video as
-    H.264 + AAC and re-mux the original audio track back in.
+5.  **Mux.** The final step shells out to ``ffmpeg`` to re-encode the
+    video as H.264 and to **stream-copy the original audio track**
+    (``-c:a copy``) so the source audio is preserved bit-for-bit — no
+    re-encoding, no quality loss. ``ffprobe`` is used to confirm the
+    output actually contains audio when the source did; mismatches raise
+    rather than silently producing a muted file.
 
 Throughout the run, optional per-frame metrics (detect/mosaic latency, GPU
 memory, face counts, mean confidence) are collected into a
@@ -494,15 +497,15 @@ class FaceMosaicProcessor:
         report.peak_gpu_mem_mb = peak_gpu_mem_mb
         report.realtime_fps = frames_processed / max(1e-9, report.total_time_s)
 
+        # Mux audio. We do NOT swallow exceptions here — silently producing a
+        # muted output is far worse than raising. The temp directory is always
+        # cleaned up via try/finally.
         mux_t0 = time.perf_counter()
         try:
             self._mux_audio(video_path, temp_video, output_path)
-        except Exception as exc:  # noqa: BLE001 — log and copy as a fallback
-            logger.warning("Audio mux failed, copying video-only output: %s", exc)
-            shutil.copy(temp_video, output_path)
-        report.mux_time_s = time.perf_counter() - mux_t0
-
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        finally:
+            report.mux_time_s = time.perf_counter() - mux_t0
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
         if report_path:
             os.makedirs(
@@ -586,32 +589,90 @@ class FaceMosaicProcessor:
         }
 
     # ------------------------------------------------------------------ audio
+    # (v0.2.0: lossless audio stream-copy with ffprobe verification.)
+
+    _FFMPEG_INSTALL_HINT = (
+        "Install ffmpeg and re-run:\n"
+        "  Windows: choco install ffmpeg  "
+        "(or download from https://ffmpeg.org/download.html and add to PATH)\n"
+        "  macOS:   brew install ffmpeg\n"
+        "  Linux:   sudo apt install ffmpeg"
+    )
 
     @staticmethod
     def _have_ffmpeg() -> bool:
         return shutil.which("ffmpeg") is not None
 
+    @staticmethod
+    def _have_ffprobe() -> bool:
+        return shutil.which("ffprobe") is not None
+
+    @staticmethod
+    def _has_audio_stream(video_path: str) -> Optional[bool]:
+        """Return True/False if ``video_path`` has audio, or ``None`` if unknown.
+
+        Uses ``ffprobe`` if available. ``None`` is returned when ffprobe is
+        missing or fails — callers should treat that as "assume yes and let
+        the mux discover otherwise".
+        """
+        if shutil.which("ffprobe") is None:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe", "-v", "error",
+                    "-select_streams", "a:0",
+                    "-show_entries", "stream=codec_type",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    video_path,
+                ],
+                capture_output=True, text=True, check=False, timeout=20,
+            )
+        except Exception:  # noqa: BLE001
+            return None
+        return result.stdout.strip() == "audio"
+
     def _mux_audio(
         self, src_with_audio: str, video_only: str, output: str
     ) -> None:
-        """Re-encode ``video_only`` as H.264/AAC and remux audio from src."""
-        if self._have_ffmpeg():
+        """Re-encode ``video_only`` as H.264 and preserve the original audio.
+
+        Audio is **stream-copied** (``-c:a copy``) so the original audio
+        track is preserved bit-for-bit — no re-encoding, no quality loss.
+        Falls back to AAC re-encoding only if stream-copy is rejected
+        (rare; happens when the source codec is incompatible with the MP4
+        container). Raises :class:`RuntimeError` if ffmpeg is unavailable
+        and the source has audio, or if the muxed output ends up with no
+        audio stream when the source had one.
+        """
+        has_audio = self._has_audio_stream(src_with_audio)
+
+        if not self._have_ffmpeg():
+            if has_audio is True:
+                raise RuntimeError(
+                    "ffmpeg CLI not found on PATH. The source video has an "
+                    "audio track, but Blurface cannot preserve it without "
+                    "ffmpeg.\n\n" + self._FFMPEG_INSTALL_HINT
+                )
+            # No audio in source (or undetectable) and no ffmpeg — copy the
+            # raw mp4v output as-is so the user still gets a video file.
+            logger.warning(
+                "ffmpeg not found; copying the raw mp4v output without "
+                "H.264 re-encoding."
+            )
+            shutil.copy(video_only, output)
+            return
+
+        # Source has no audio: just re-encode video to H.264.
+        if has_audio is False:
+            logger.info(
+                "Source has no audio stream; producing a video-only output."
+            )
             cmd = [
-                "ffmpeg",
-                "-y",
-                "-i", video_only,
-                "-i", src_with_audio,
-                "-map", "0:v:0",
-                "-map", "1:a:0?",
-                "-c:v", "libx264",
-                "-preset", "medium",
-                "-crf", "20",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-shortest",
+                "ffmpeg", "-y", "-i", video_only,
+                "-c:v", "libx264", "-preset", "medium", "-crf", "20",
                 output,
             ]
-            logger.info("Muxing audio: ffmpeg -> %s", output)
             proc = subprocess.run(cmd, capture_output=True, text=True)
             if proc.returncode != 0:
                 raise RuntimeError(
@@ -620,37 +681,60 @@ class FaceMosaicProcessor:
                 )
             return
 
-        try:
-            import ffmpeg  # ffmpeg-python  # noqa: WPS433
-        except ImportError as exc:
-            raise RuntimeError(
-                "ffmpeg CLI not found and ffmpeg-python is not installed; "
-                "install ffmpeg (https://ffmpeg.org/download.html) to enable "
-                "audio passthrough."
-            ) from exc
+        # Source has audio (or we couldn't probe). Re-encode video to H.264,
+        # and stream-copy the original audio so it is preserved exactly.
+        logger.info(
+            "Muxing -> %s  (video: H.264 re-encode, audio: stream-copy)",
+            output,
+        )
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", video_only,
+            "-i", src_with_audio,
+            "-map", "0:v:0",
+            "-map", "1:a:0?",      # '?' tolerates the (rare) probe-was-wrong case
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "20",
+            "-c:a", "copy",        # preserve the original audio bit-for-bit
+            "-shortest",
+            output,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True)
 
-        video_in = ffmpeg.input(video_only)
-        audio_in = ffmpeg.input(src_with_audio)
-        try:
-            (
-                ffmpeg.output(
-                    video_in.video,
-                    audio_in.audio,
-                    output,
-                    vcodec="libx264",
-                    preset="medium",
-                    crf=20,
-                    acodec="aac",
-                    audio_bitrate="192k",
-                    shortest=None,
-                )
-                .overwrite_output()
-                .run(quiet=True)
+        if proc.returncode != 0:
+            # Stream-copy fails when the source audio codec is not allowed
+            # in the MP4 container (e.g. PCM-in-WAV). Re-encode as AAC.
+            logger.warning(
+                "Audio stream-copy failed; re-encoding as AAC 192k "
+                "(quality preserved, original codec is lost). "
+                "ffmpeg said: %s",
+                proc.stderr[-300:].strip(),
             )
-        except ffmpeg.Error:
-            (
-                ffmpeg.input(video_only)
-                .output(output, vcodec="libx264", preset="medium", crf=20)
-                .overwrite_output()
-                .run(quiet=True)
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", video_only,
+                "-i", src_with_audio,
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
+                "-c:v", "libx264",
+                "-preset", "medium", "-crf", "20",
+                "-c:a", "aac", "-b:a", "192k",
+                "-shortest",
+                output,
+            ]
+            proc = subprocess.run(cmd, capture_output=True, text=True)
+
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed to mux audio (exit {proc.returncode}): "
+                f"{proc.stderr[-400:]}"
+            )
+
+        # Belt-and-braces: verify the output actually contains audio.
+        if has_audio is True and self._has_audio_stream(output) is False:
+            raise RuntimeError(
+                f"ffmpeg reported success, but the output file '{output}' "
+                f"contains no audio stream. This is a Blurface bug — please "
+                f"report it at https://github.com/Ezharjan/blurface/issues."
             )
