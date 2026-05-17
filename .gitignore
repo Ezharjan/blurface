@@ -1,6 +1,8 @@
 # Video and image files
 *.mp4
 *.jpg
+*.jpeg
+*.png
 
 # Python bytecode
 __pycache__/
@@ -10,11 +12,13 @@ __pycache__/
 build/
 dist/
 *.egg-info/
+pip-wheel-metadata/
 
 # Virtual environments
 .venv/
 venv/
 ENV/
+env/
 
 # IDEs
 .idea/
@@ -23,3 +27,12 @@ ENV/
 # Temporary files
 *.log
 *.cache
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+
+# Run outputs
+out/
+output/
+report/
+plots/

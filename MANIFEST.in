@@ -1,0 +1,9 @@
+include README.md
+include LICENSE
+include pyproject.toml
+recursive-include blurface *.py
+recursive-exclude tests *
+recursive-exclude scripts *
+global-exclude __pycache__
+global-exclude *.py[cod]
+global-exclude .DS_Store
